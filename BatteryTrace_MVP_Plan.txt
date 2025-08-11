@@ -1,0 +1,245 @@
+BatteryTrace — iOS MVP Plan
+Version: 1.0
+Last updated: Aug 10, 2025
+
+------------------------------------------------------------
+1) Objective
+------------------------------------------------------------
+Build a lightweight iOS app that:
+• Logs and visualizes long‑term battery degradation (Max Capacity % vs. Date, and vs. Cycle Count).
+• Estimates charge power (W) during a charging session using percent‑over‑time + device battery capacity.
+• Works within public iOS constraints (no private APIs), using a Shortcut-based bridge for cycle/health data.
+
+------------------------------------------------------------
+2) Reality Check (What iOS Exposes Publicly)
+------------------------------------------------------------
+• On-device public APIs provide:
+  – UIDevice.batteryLevel (percentage as a 0.0–1.0 float)
+  – UIDevice.batteryState (.unplugged, .charging, .full, .unknown)
+• No public API for:
+  – Cycle count
+  – Manufacture date or first-use date
+  – Instantaneous charge current/voltage/wattage
+• Apple shows cycle count / first-use / manufacture date in Settings on newer devices, but that view is not programmatically accessible.
+• Therefore, the app will:
+  – Use a Shortcut to parse Apple Analytics logs (user-initiated) and return cycle/health data to the app.
+  – Estimate charge power by sampling batteryLevel over time in the foreground and combining with a model-specific mAh capacity table.
+
+------------------------------------------------------------
+3) MVP Scope & Outcomes (2–3 weeks build)
+------------------------------------------------------------
+Core outcomes:
+1. Plot Battery Health and Cycle Count over time (line + scatter).
+2. Show a Degradation curve: Max Capacity % vs. Cycle Count (with an optional smoothed trend line).
+3. Estimate charging power (W) during a session (Avg W, Peak W), derived from percent change over time and device mAh.
+4. One-tap “Refresh cycles” that runs the Shortcut and ingests cycle/health/dates into the app.
+
+Non-goals for MVP:
+• Continuous background logging of watts (not reliable/possible with public APIs).
+• Perfectly accurate wattage (treated as an estimate; device usage/drain affects slope).
+
+------------------------------------------------------------
+4) Data Sources & Flow
+------------------------------------------------------------
+A) Cycles / Health / Dates (semi-automatic via Shortcuts)
+• User installs an iOS Shortcut that reads the latest Analytics log and extracts fields such as:
+  – CycleCount
+  – BatteryHealth (or MaxCapacityPercent where available)
+  – FirstUseDate
+  – ManufactureDate
+• Integration pattern:
+  1) App registers a custom URL scheme, e.g., batterytrace://
+  2) App triggers Shortcut via x-callback-url:
+     shortcuts://x-callback-url/run-shortcut?name=Battery%20Cycles
+     (Optionally include x-success=batterytrace://ingest-ready)
+  3) The Shortcut ends with an “Open URL” action that calls back into the app with query parameters:
+     batterytrace://ingest?cycles=123&health=0.94&first_use=2024-09-21&mfg=2024-08-30
+  4) App ingests/validates the payload and stores a timestamped Snapshot in Core Data.
+
+• Setup notes for users:
+  – Settings → Privacy & Security → Analytics & Improvements → Analytics Data (ensure Analytics logs are enabled).
+  – Run the Shortcut once to grant any permissions.
+  – The Shortcut can be run from the app’s “Refresh cycles” button.
+
+• Provided Shortcut (example from the user):
+  https://www.icloud.com/shortcuts/53f0900518564258ad5b06867b032a1e
+  (You can clone/extend this to add the final “Open URL” step back to the app.)
+
+B) Charging Session Estimation (on-device, foreground)
+• While the app is open and the device is charging:
+  – Sample UIDevice.batteryLevel at a fixed cadence (e.g., every 5 seconds).
+  – Maintain a rolling window (e.g., 60–120 seconds) of (timestamp, level) pairs.
+  – Compute slope (Δ% / Δt) and convert to current/power using a device capacity table.
+
+• Estimation formulas:
+  – Let capacity_mAh = device nominal capacity (from internal lookup; user can override).
+  – Let Δpct = (level_t2 - level_t1) * 100, Δt_hours = (t2 - t1) / 3600.
+  – Estimated charging current (mA) ≈ capacity_mAh * (Δpct / 100) / Δt_hours
+  – Assume nominal battery voltage V_nom ≈ 3.82 V (you may tune per model).
+  – Estimated power (W) ≈ (mA / 1000) * V_nom
+  – Apply exponential moving average (EMA) smoothing:
+    EMA_t = α * x_t + (1 - α) * EMA_(t-1), where α = 2 / (N + 1), N ≈ window length in samples.
+
+• Caveats:
+  – Device usage during charging (screen on, CPU load) reduces net slope, underreporting power.
+  – Wireless/MagSafe charging has ramp/thermal behavior—expect step changes.
+  – Treat numbers as estimates for relative comparison across chargers/cables/sessions.
+
+C) Device Capacity Catalog
+• Ship a lightweight JSON mapping e.g., “iPhone15,4” → 3274 mAh (example), etc.
+• Allow user override (Settings → BatteryTrace → “Edit Device Capacity”) for accuracy.
+• Provide a “Calibrate” mode: estimate effective capacity by measuring a long, stable charge segment.
+
+------------------------------------------------------------
+5) Features (MVP)
+------------------------------------------------------------
+Capture
+• Refresh Cycles: One tap runs the Shortcut, returns cycles/health/dates, logs a Snapshot.
+• Live Charge Session: Auto-start when state == .charging while app is foreground; log samples until unplugged or full.
+
+Modeling & Metrics
+• Per-session metrics: Avg W (est.), Peak W (est.), Δ%, duration, ETA to full (based on recent slope).
+• Label sessions with charger type: user-selectable (e.g., “5W Brick”, “20W PD”, “MagSafe 15W”), plus free-form notes.
+
+Visualizations (Swift Charts)
+• Health over time (Max Capacity % vs. Date)
+• Cycles over time (Cycles vs. Date)
+• Degradation curve (Max Capacity % vs. Cycles), with optional LOESS/EMA trend
+• Charge session mini-charts on cards
+
+Export
+• CSV export for Snapshots and Sessions (for Numbers/Sheets).
+
+UX Copy & Disclaimers
+• “Estimates only: iOS does not expose live watts/amps. Values are inferred from percent change over time plus device capacity.”
+• Clear, friendly setup for Shortcut integration, with a “Test Shortcut” button.
+
+------------------------------------------------------------
+6) App Architecture (SwiftUI)
+------------------------------------------------------------
+Modules
+• BatteryManager: Enables UIDevice battery monitoring, observes state/level notifications, manages session lifecycle and sampling timer.
+• ShortcutIngestor: Handles batterytrace://ingest URLs, validates parameters, writes Snapshots.
+• DeviceCatalog: Provides model→mAh lookup; lets users override capacity.
+• Data Layer: Core Data with two entities:
+  – Snapshot { id, date, cycles (Int?), health (Double? 0.0–1.0), firstUse (Date?), mfgDate (Date?) }
+  – Session { id, start (Date), end (Date?), avgW (Double?), peakW (Double?), deltaPct (Double?), model (String), notes (String?) }
+• Charts: Swift Charts views for Snapshot and Session plots.
+• Settings: Controls for sampling interval, EMA window, capacity override, privacy/export.
+
+App Lifecycle
+• On launch, enable battery monitoring.
+• When batteryState changes to .charging and app is in foreground, start a Session.
+• Append samples; compute smoothed W estimates; close session on unplug/full/background (with best effort).
+
+------------------------------------------------------------
+7) Implementation Notes & Gotchas
+------------------------------------------------------------
+• Simulator returns -1 for batteryLevel; test on a real device.
+• Background collection: BGTaskScheduler is not suitable for fine-grained sampling; keep “Live Session” as a foreground feature.
+• Ensure robust URL decoding for Shortcut parameters; reject malformed data.
+• Handle clock skew/timezone; store all timestamps in UTC.
+• Provide migration-safe Core Data model (v1 schema defined above).
+• Performance: sampling every 5–10s is sufficient; avoid battery drain by pausing when not charging/foreground.
+• Accessbility & Localization: prefer SF Symbols and Dynamic Type; copy in plain language.
+
+------------------------------------------------------------
+8) App Review Considerations
+------------------------------------------------------------
+• No claims of reading private battery metrics; clearly state that cycle/health values come from a user-initiated Shortcut.
+• No misleading “live watts/amps” claims; label as “Estimated”.
+• Privacy: all data stays on device by default; export is user-initiated.
+• Include a “Delete all data” control.
+
+------------------------------------------------------------
+9) Privacy & Data Retention
+------------------------------------------------------------
+• Default: On-device storage only; no accounts, no cloud sync in MVP.
+• Optional iCloud sync can come later (CloudKit); out of MVP scope.
+• In Settings: toggle for Analytics-based Shortcut integration instructions (turn on/off guidance).
+
+------------------------------------------------------------
+10) Roadmap After MVP
+------------------------------------------------------------
+• Widgets & Live Activity: show “Charging ~18 W (est.)” when app was opened recently.
+• Charger Auto-Tagging: infer wired vs. wireless, fast vs. trickle, from slope thresholds and session shape.
+• Mac Helper (optional): When iPhone is connected to a Mac, log cycles/health from trusted desktop tools and import CSV to backfill history.
+• Community Calibration: crowdsource correction factors by model/charger (opt-in, privacy-preserving).
+• Cloud Sync & Backups: iCloud (CloudKit) with conflict resolution.
+• Alerts: suggest “Battery care” tips when degradation accelerates abnormally (heuristic/trend-based).
+
+------------------------------------------------------------
+11) QA Checklist (MVP)
+------------------------------------------------------------
+□ Shortcut integration path tested end-to-end, including URL callback and payload validation.
+□ Sampling and EMA smoothing produce sane estimates across wired vs. wireless charging.
+□ Session lifecycle: start/stop behaviors on plug/unplug, background/foreground transitions.
+□ CSV export imports cleanly into Numbers/Google Sheets.
+□ Charts render correctly with small and large datasets; empty states are friendly.
+□ Accessibility pass (Dynamic Type, VoiceOver labels).
+□ App Review smoke check (wording, disclaimers, no private API usage).
+
+------------------------------------------------------------
+12) User Setup Instructions (One-Pager)
+------------------------------------------------------------
+1) Install the BatteryTrace Shortcut:
+   – Open: https://www.icloud.com/shortcuts/53f0900518564258ad5b06867b032a1e
+   – Add an “Open URL” action at the end that calls:
+     batterytrace://ingest?cycles=[[CycleCount]]&health=[[BatteryHealth]]&first_use=[[FirstUseDate]]&mfg=[[ManufactureDate]]
+     (Ensure values are URL-encoded if they contain spaces.)
+2) Enable Analytics logs (if not already):
+   – Settings → Privacy & Security → Analytics & Improvements → Analytics Data (toggle on where applicable).
+3) In the app, tap “Refresh cycles” to run the Shortcut and save a Snapshot.
+4) To estimate charging power, open BatteryTrace while your phone is charging and leave it on-screen for a few minutes.
+
+------------------------------------------------------------
+13) Algorithm Pseudocode (Charge Estimation)
+------------------------------------------------------------
+Initialize:
+  windowSeconds = 90
+  sampleInterval = 5
+  V_nom = 3.82
+  capacity_mAh = lookupModelCapacity() // user-editable
+  ema = None
+Loop (while app in foreground AND batteryState == .charging):
+  level = UIDevice.batteryLevel // 0.0..1.0
+  t = now()
+  append (t, level) to samples; drop points older than windowSeconds
+  if enough span:
+    pct1, t1 = oldest sample
+    pct2, t2 = newest sample
+    deltaPct = (pct2 - pct1) * 100
+    deltaHours = (t2 - t1) / 3600
+    if deltaHours > 0 and deltaPct > 0:
+      mA = capacity_mAh * (deltaPct / 100) / deltaHours
+      W = (mA / 1000.0) * V_nom
+      ema = W if ema is None else (alpha * W + (1 - alpha) * ema)
+      update session metrics (avg/peak/eta) with ema
+Sleep sampleInterval seconds
+
+Stop conditions:
+  – batteryState != .charging
+  – user leaves app or explicitly stops the session
+
+------------------------------------------------------------
+14) Deliverables (MVP)
+------------------------------------------------------------
+• Xcode project (SwiftUI) with:
+  – BatteryManager (sampling, session lifecycle)
+  – ShortcutIngestor (URL handling)
+  – DeviceCatalog (model→mAh, overrides)
+  – Core Data (Snapshot, Session)
+  – Swift Charts views
+  – CSV export
+• “Connect Shortcut” setup screen + one-page instructions
+• App Store-friendly copy with disclaimers
+
+------------------------------------------------------------
+15) Naming & Branding (Placeholder)
+------------------------------------------------------------
+Working name: “BatteryTrace”
+Tagline: “Know your battery. Over time.”
+Icon: clean outline of a battery with a tiny trend line overlay.
+
+------------------------------------------------------------
+End of document.
